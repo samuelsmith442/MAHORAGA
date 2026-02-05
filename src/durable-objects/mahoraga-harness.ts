@@ -258,8 +258,8 @@ const SOURCE_CONFIG = {
 };
 
 const DEFAULT_CONFIG: AgentConfig = {
-  data_poll_interval_ms: 30_000,
-  analyst_interval_ms: 120_000,
+  data_poll_interval_ms: 180_000,
+  analyst_interval_ms: 300_000,
   max_position_value: 5000,
   max_positions: 5,
   min_sentiment_score: 0.3,
@@ -288,12 +288,12 @@ const DEFAULT_CONFIG: AgentConfig = {
   options_max_delta: 0.7,
   options_stop_loss_pct: 50,
   options_take_profit_pct: 100,
-  crypto_enabled: false,
+  crypto_enabled: true,
   crypto_symbols: ["BTC/USD", "ETH/USD", "SOL/USD"],
-  crypto_momentum_threshold: 2.0,
+  crypto_momentum_threshold: 3.0,
   crypto_max_position_value: 1000,
-  crypto_take_profit_pct: 10,
-  crypto_stop_loss_pct: 5,
+  crypto_take_profit_pct: 12,
+  crypto_stop_loss_pct: 6,
   ticker_blacklist: [],
   allowed_exchanges: ["NYSE", "NASDAQ", "ARCA", "AMEX", "BATS"],
 };

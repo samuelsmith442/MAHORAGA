@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mahoraga Dashboard - Setup Token</title>
+    <style>
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            max-width: 600px;
+            margin: 50px auto;
+            padding: 20px;
+            background: #0a0a0a;
+            color: #fff;
+        }
+        .container {
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 30px;
+        }
+        h1 {
+            color: #00ff88;
+            margin-top: 0;
+        }
+        input {
+            width: 100%;
+            padding: 12px;
+            margin: 10px 0;
+            background: #0a0a0a;
+            border: 1px solid #333;
+            border-radius: 4px;
+            color: #fff;
+            font-family: monospace;
+            font-size: 14px;
+        }
+        button {
+            background: #00ff88;
+            color: #0a0a0a;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            font-size: 16px;
+            width: 100%;
+            margin-top: 10px;
+        }
+        button:hover {
+            background: #00dd77;
+        }
+        .success {
+            background: #00ff88;
+            color: #0a0a0a;
+            padding: 12px;
+            border-radius: 4px;
+            margin-top: 20px;
+            display: none;
+        }
+        .info {
+            background: #1a3a4a;
+            border-left: 3px solid #00aaff;
+            padding: 12px;
+            margin: 20px 0;
+            font-size: 14px;
+        }
+        code {
+            background: #0a0a0a;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: monospace;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔐 Mahoraga Dashboard Setup</h1>
+        
+        <div class="info">
+            <strong>Your API Token:</strong><br>
+            <code>Y0ILrlD0kzwD67wKgnokrS/hvOTOqiFZSqzyKGtCAKcDLqr6N+NGzqBtOb7v/Yie</code>
+        </div>
+
+        <p>Enter your Mahoraga API token to access the dashboard:</p>
+        
+        <input 
+            type="text" 
+            id="tokenInput" 
+            placeholder="Paste your API token here"
+            value="Y0ILrlD0kzwD67wKgnokrS/hvOTOqiFZSqzyKGtCAKcDLqr6N+NGzqBtOb7v/Yie"
+        >
+        
+        <button onclick="saveToken()">Save Token & Open Dashboard</button>
+        
+        <div class="success" id="successMessage">
+            ✅ Token saved successfully! Redirecting to dashboard...
+        </div>
+    </div>
+
+    <script>
+        function saveToken() {
+            const token = document.getElementById('tokenInput').value.trim();
+            
+            if (!token) {
+                alert('Please enter a token');
+                return;
+            }
+            
+            // Save to localStorage
+            localStorage.setItem('mahoraga_api_token', token);
+            
+            // Show success message
+            document.getElementById('successMessage').style.display = 'block';
+            
+            // Redirect to dashboard after 1 second
+            setTimeout(() => {
+                window.location.href = '/';
+            }, 1000);
+        }
+
+        // Allow Enter key to submit
+        document.getElementById('tokenInput').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                saveToken();
+            }
+        });
+    </script>
+</body>
+</html>

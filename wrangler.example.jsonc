@@ -45,22 +45,22 @@
 		{
 			"binding": "DB",
 			"database_name": "mahoraga-db",
-			"database_id": "<YOUR_D1_DATABASE_ID>",
+			"database_id": "9d0ff22b-7f6e-43fa-8d56-da87ec8930b4",
 			"migrations_dir": "migrations"
 		}
 	],
 	"kv_namespaces": [
 		{
 			"binding": "CACHE",
-			"id": "<YOUR_KV_NAMESPACE_ID>"
+			"id": "af345ea4dbde4f60bfc29df4ddb745e9"
 		}
 	],
-	"r2_buckets": [
-		{
-			"binding": "ARTIFACTS",
-			"bucket_name": "mahoraga-artifacts"
-		}
-	],
+	// "r2_buckets": [
+	// 	{
+	// 		"binding": "ARTIFACTS",
+	// 		"bucket_name": "mahoraga-artifacts"
+	// 	}
+	// ],
 	"durable_objects": {
 		"bindings": [
 			{
