@@ -226,6 +226,11 @@ const SOURCE_CONFIG = {
     reddit_stocks: 0.9,
     reddit_investing: 0.8,
     reddit_options: 0.85,
+    reddit_cryptocurrency: 0.85,
+    reddit_bitcoin: 0.8,
+    reddit_ethereum: 0.8,
+    reddit_solana: 0.75,
+    fear_greed: 0.9,
     twitter_fintwit: 0.95,
     twitter_news: 0.9,
     sec_8k: 0.95,
@@ -258,12 +263,12 @@ const SOURCE_CONFIG = {
 };
 
 const DEFAULT_CONFIG: AgentConfig = {
-  data_poll_interval_ms: 180_000,
-  analyst_interval_ms: 300_000,
+  data_poll_interval_ms: 150_000,
+  analyst_interval_ms: 240_000,
   max_position_value: 5000,
-  max_positions: 5,
-  min_sentiment_score: 0.3,
-  min_analyst_confidence: 0.6,
+  max_positions: 8,
+  min_sentiment_score: 0.25,
+  min_analyst_confidence: 0.55,
   take_profit_pct: 10,
   stop_loss_pct: 5,
   position_size_pct_of_cash: 25,
@@ -289,8 +294,8 @@ const DEFAULT_CONFIG: AgentConfig = {
   options_stop_loss_pct: 50,
   options_take_profit_pct: 100,
   crypto_enabled: true,
-  crypto_symbols: ["BTC/USD", "ETH/USD", "SOL/USD"],
-  crypto_momentum_threshold: 3.0,
+  crypto_symbols: ["BTC/USD", "ETH/USD", "SOL/USD", "DOGE/USD", "AVAX/USD", "LINK/USD", "DOT/USD", "MATIC/USD", "UNI/USD", "AAVE/USD"],
+  crypto_momentum_threshold: 1.5,
   crypto_max_position_value: 1000,
   crypto_take_profit_pct: 12,
   crypto_stop_loss_pct: 6,
@@ -832,7 +837,7 @@ export class MahoragaHarness extends DurableObject<Env> {
     this.ctx.blockConcurrencyWhile(async () => {
       const stored = await this.ctx.storage.get<AgentState>("state");
       if (stored) {
-        this.state = { ...DEFAULT_STATE, ...stored };
+        this.state = { ...DEFAULT_STATE, ...stored, config: { ...stored.config, ...DEFAULT_CONFIG } };
       }
       this.initializeLLM();
 
@@ -1240,14 +1245,15 @@ export class MahoragaHarness extends DurableObject<Env> {
 
     await tickerCache.refreshSecTickersIfNeeded();
 
-    const [stocktwitsSignals, redditSignals, cryptoSignals, secSignals] = await Promise.all([
+    const [stocktwitsSignals, redditSignals, cryptoSignals, secSignals, fearGreedSignals] = await Promise.all([
       this.gatherStockTwits(),
       this.gatherReddit(),
       this.gatherCrypto(),
       this.gatherSECFilings(),
+      this.gatherFearGreedIndex(),
     ]);
 
-    const allSignals = [...stocktwitsSignals, ...redditSignals, ...cryptoSignals, ...secSignals];
+    const allSignals = [...stocktwitsSignals, ...redditSignals, ...cryptoSignals, ...secSignals, ...fearGreedSignals];
 
     const MAX_SIGNALS = 200;
     const MAX_AGE_MS = 24 * 60 * 60 * 1000;
@@ -1265,6 +1271,7 @@ export class MahoragaHarness extends DurableObject<Env> {
       reddit: redditSignals.length,
       crypto: cryptoSignals.length,
       sec: secSignals.length,
+      fear_greed: fearGreedSignals.length,
       total: this.state.signalCache.length,
     });
   }
@@ -1370,7 +1377,7 @@ export class MahoragaHarness extends DurableObject<Env> {
   }
 
   private async gatherReddit(): Promise<Signal[]> {
-    const subreddits = ["wallstreetbets", "stocks", "investing", "options"];
+    const subreddits = ["wallstreetbets", "stocks", "investing", "options", "cryptocurrency", "bitcoin", "ethereum", "solana"];
     const tickerData = new Map<
       string,
       {
@@ -1556,6 +1563,85 @@ export class MahoragaHarness extends DurableObject<Env> {
     }
 
     this.log("Crypto", "gathered_signals", { count: signals.length });
+    return signals;
+  }
+
+  private async gatherFearGreedIndex(): Promise<Signal[]> {
+    if (!this.state.config.crypto_enabled) return [];
+
+    const signals: Signal[] = [];
+    const sourceWeight = SOURCE_CONFIG.weights.fear_greed;
+
+    try {
+      const res = await fetch("https://api.alternative.me/fng/?limit=1");
+      if (!res.ok) {
+        this.log("FearGreed", "fetch_error", { status: res.status });
+        return [];
+      }
+
+      const data = (await res.json()) as {
+        data?: Array<{
+          value: string;
+          value_classification: string;
+          timestamp: string;
+        }>;
+      };
+
+      const entry = data.data?.[0];
+      if (!entry) return [];
+
+      const fngValue = parseInt(entry.value, 10);
+      const classification = entry.value_classification;
+
+      // Convert 0-100 scale to sentiment:
+      // 0-25 = Extreme Fear → bullish signal (contrarian: buy when others are fearful)
+      // 25-45 = Fear → mildly bullish
+      // 45-55 = Neutral → no signal
+      // 55-75 = Greed → mildly bearish (caution)
+      // 75-100 = Extreme Greed → bearish signal (contrarian: sell when others are greedy)
+      let sentiment = 0;
+      if (fngValue <= 25) {
+        sentiment = 0.6 + (25 - fngValue) / 25 * 0.4; // 0.6 to 1.0 (strong buy)
+      } else if (fngValue <= 45) {
+        sentiment = 0.2 + (45 - fngValue) / 20 * 0.4; // 0.2 to 0.6
+      } else if (fngValue <= 55) {
+        sentiment = 0; // neutral zone
+      } else if (fngValue <= 75) {
+        sentiment = -0.1 - (fngValue - 55) / 20 * 0.3; // -0.1 to -0.4
+      } else {
+        sentiment = -0.4 - (fngValue - 75) / 25 * 0.4; // -0.4 to -0.8
+      }
+
+      const weightedSentiment = sentiment * sourceWeight;
+
+      // Apply fear/greed signal to all tracked crypto symbols
+      const cryptoSymbols = this.state.config.crypto_symbols || ["BTC/USD", "ETH/USD", "SOL/USD"];
+      for (const symbol of cryptoSymbols) {
+        signals.push({
+          symbol,
+          source: "fear_greed",
+          source_detail: "alternative_me_fng",
+          sentiment: weightedSentiment,
+          raw_sentiment: sentiment,
+          volume: 1,
+          freshness: 1.0,
+          source_weight: sourceWeight,
+          reason: `Fear&Greed: ${fngValue}/100 (${classification}) → ${sentiment > 0 ? "contrarian bullish" : sentiment < 0 ? "contrarian bearish" : "neutral"}`,
+          isCrypto: true,
+          timestamp: Date.now(),
+        });
+      }
+
+      this.log("FearGreed", "gathered", {
+        value: fngValue,
+        classification,
+        sentiment: weightedSentiment.toFixed(3),
+        symbols: cryptoSymbols.length,
+      });
+    } catch (error) {
+      this.log("FearGreed", "error", { message: String(error) });
+    }
+
     return signals;
   }
 

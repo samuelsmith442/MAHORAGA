@@ -74,7 +74,7 @@ export function createLLMProvider(env: Env): LLMProvider | null {
       }
       return createOpenAIProvider({
         apiKey: env.OPENAI_API_KEY,
-        model: model.includes("/") ? model.split("/")[1] : model,
+        model: openaiBaseUrl ? model : (model.includes("/") ? model.split("/")[1] : model),
         baseUrl: openaiBaseUrl,
       });
   }
