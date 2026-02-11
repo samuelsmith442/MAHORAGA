@@ -274,14 +274,14 @@ const DEFAULT_CONFIG: AgentConfig = {
   position_size_pct_of_cash: 25,
   stale_position_enabled: true,
   stale_min_hold_hours: 24,
-  stale_max_hold_days: 3,
-  stale_min_gain_pct: 5,
+  stale_max_hold_days: 2,
+  stale_min_gain_pct: 3,
   stale_mid_hold_days: 2,
   stale_mid_min_gain_pct: 3,
   stale_social_volume_decay: 0.3,
   llm_provider: "openai-raw",
   llm_model: "gpt-4o-mini",
-  llm_analyst_model: "gpt-4o",
+  llm_analyst_model: "z-ai/glm-5",
   llm_min_hold_minutes: 30,
   options_enabled: false,
   options_min_confidence: 0.8,
@@ -1377,7 +1377,7 @@ export class MahoragaHarness extends DurableObject<Env> {
   }
 
   private async gatherReddit(): Promise<Signal[]> {
-    const subreddits = ["wallstreetbets", "stocks", "investing", "options", "cryptocurrency", "bitcoin", "ethereum", "solana"];
+    const subreddits = ["wallstreetbets", "stocks", "investing", "options", "cryptocurrency", "bitcoin"];
     const tickerData = new Map<
       string,
       {
@@ -1398,7 +1398,7 @@ export class MahoragaHarness extends DurableObject<Env> {
       const sourceWeight = SOURCE_CONFIG.weights[`reddit_${sub}` as keyof typeof SOURCE_CONFIG.weights] || 0.7;
 
       try {
-        const res = await fetch(`https://www.reddit.com/r/${sub}/hot.json?limit=25`, {
+        const res = await fetch(`https://www.reddit.com/r/${sub}/hot.json?limit=15`, {
           headers: { "User-Agent": "Mahoraga/2.0" },
         });
         if (!res.ok) continue;
@@ -1819,10 +1819,32 @@ export class MahoragaHarness extends DurableObject<Env> {
     for (const pos of cryptoPositions) {
       const plPct = (pos.unrealized_pl / (pos.market_value - pos.unrealized_pl)) * 100;
 
+      // Update peak price for trailing stop tracking
+      const entry = this.state.positionEntries[pos.symbol];
+      if (entry) {
+        entry.peak_price = Math.max(entry.peak_price, pos.current_price);
+      }
+
       if (plPct >= this.state.config.crypto_take_profit_pct) {
         this.log("Crypto", "take_profit", { symbol: pos.symbol, pnl: plPct.toFixed(2) });
         await this.executeSell(alpaca, pos.symbol, `Crypto take profit at +${plPct.toFixed(1)}%`);
         continue;
+      }
+
+      // Trailing stop: if position was up 6%+ and dropped back to 3%, lock in gains
+      if (entry && entry.entry_price > 0 && entry.peak_price > 0) {
+        const peakGainPct = ((entry.peak_price - entry.entry_price) / entry.entry_price) * 100;
+        const TRAILING_ACTIVATION_PCT = 6;
+        const TRAILING_LOCK_PCT = 3;
+        if (peakGainPct >= TRAILING_ACTIVATION_PCT && plPct <= TRAILING_LOCK_PCT) {
+          this.log("Crypto", "trailing_stop", {
+            symbol: pos.symbol,
+            pnl: plPct.toFixed(2),
+            peak_gain: peakGainPct.toFixed(2),
+          });
+          await this.executeSell(alpaca, pos.symbol, `Crypto trailing stop: was +${peakGainPct.toFixed(1)}%, now +${plPct.toFixed(1)}%`);
+          continue;
+        }
       }
 
       if (plPct <= -this.state.config.crypto_stop_loss_pct) {
@@ -1831,7 +1853,7 @@ export class MahoragaHarness extends DurableObject<Env> {
       }
     }
 
-    const maxCryptoPositions = Math.min(this.state.config.crypto_symbols?.length || 3, 3);
+    const maxCryptoPositions = Math.min(this.state.config.crypto_symbols?.length || 3, 5);
     if (cryptoPositions.length >= maxCryptoPositions) return;
 
     const cryptoSignals = this.state.signalCache
@@ -1890,18 +1912,37 @@ export class MahoragaHarness extends DurableObject<Env> {
         ? ((snapshot.daily_bar.c - snapshot.prev_daily_bar.c) / snapshot.prev_daily_bar.c) * 100
         : 0;
 
-      const prompt = `Should we BUY this cryptocurrency based on momentum and market conditions?
+      // Extract Fear & Greed data from signal cache for context
+      const fngSignal = this.state.signalCache.find((s) => s.source === "fear_greed" && s.symbol === symbol);
+      const fngReason = fngSignal?.reason || "N/A";
+
+      // Count how many independent sources confirm this signal
+      const confirmingSources = this.state.signalCache
+        .filter((s) => s.symbol === symbol && s.sentiment > 0)
+        .map((s) => s.source);
+      const uniqueSources = [...new Set(confirmingSources)];
+
+      const prompt = `Should we BUY this cryptocurrency based on momentum, sentiment, and market regime?
 
 SYMBOL: ${symbol}
 PRICE: $${price.toFixed(2)}
 24H CHANGE: ${dailyChange.toFixed(2)}%
 MOMENTUM SCORE: ${(momentum * 100).toFixed(0)}%
 SENTIMENT: ${(sentiment * 100).toFixed(0)}% bullish
+CONFIRMING SOURCES (${uniqueSources.length}): ${uniqueSources.join(", ") || "none"}
+MARKET FEAR & GREED: ${fngReason}
+
+MARKET REGIME GUIDANCE:
+- If Fear & Greed is 45-55 (Neutral) or market is choppy/sideways, require STRONGER conviction to BUY
+- If Fear & Greed shows Extreme Fear (<25), this is contrarian bullish — good entries if momentum confirms
+- If Fear & Greed shows Extreme Greed (>75), be very cautious — likely late to the move
+- Multiple confirming sources (3+) significantly increases signal reliability
+- Single-source signals in choppy markets should generally be WAIT or SKIP
 
 Evaluate if this is a good entry. Consider:
-- Is the momentum sustainable or a trap?
-- Any major news/events affecting this crypto?
-- Risk/reward at current price level?
+- Is the momentum sustainable or a bull trap / dead cat bounce?
+- Is the market trending or ranging? Only buy strong setups in ranging markets.
+- Risk/reward at current price level given recent volatility?
 
 JSON response:
 {
@@ -2299,15 +2340,32 @@ JSON response:
           snapshot?.latest_trade?.price || snapshot?.latest_quote?.ask_price || snapshot?.latest_quote?.bid_price || 0;
       }
 
-      const prompt = `Should we BUY this ${isCrypto ? "crypto" : "stock"} based on social sentiment and fundamentals?
+      // Gather all signals for this symbol to provide richer context
+      const allSymbolSignals = this.state.signalCache.filter((s) => s.symbol === symbol);
+      const uniqueSourcesForSymbol = [...new Set(allSymbolSignals.map((s) => s.source))];
+      const avgAge = allSymbolSignals.length > 0
+        ? Math.round(allSymbolSignals.reduce((sum, s) => sum + (Date.now() - s.timestamp), 0) / allSymbolSignals.length / 60000)
+        : 0;
+
+      // Get Fear & Greed context if available
+      const fngSignal = this.state.signalCache.find((s) => s.source === "fear_greed");
+      const fngContext = fngSignal?.reason || "N/A";
+
+      const prompt = `Should we BUY this ${isCrypto ? "crypto" : "stock"} based on social sentiment and market conditions?
 
 SYMBOL: ${symbol}
-SENTIMENT: ${(sentimentScore * 100).toFixed(0)}% bullish (sources: ${sources.join(", ")})
+PRICE: $${price}
+SENTIMENT: ${(sentimentScore * 100).toFixed(0)}% bullish
+SOURCES (${uniqueSourcesForSymbol.length} independent): ${sources.join(", ")}
+SIGNAL AGE: ~${avgAge} minutes avg
+${isCrypto ? `MARKET FEAR & GREED: ${fngContext}` : ""}
 
-CURRENT DATA:
-- Price: $${price}
-
-Evaluate if this is a good entry. Consider: Is the sentiment justified? Is it too late (already pumped)? Any red flags?
+EVALUATION CRITERIA:
+- Multiple independent sources (3+) = higher reliability
+- Single-source signals in uncertain markets = be cautious
+- Fresh signals (<30 min) are more actionable than stale ones
+- Is the sentiment justified by fundamentals or just hype?
+- Is it too late (already pumped) or early enough for good risk/reward?
 
 JSON response:
 {
@@ -2541,7 +2599,15 @@ Provide a brief risk assessment and recommendation (HOLD, SELL, or ADD). JSON fo
     }
 
     const positionSymbols = new Set(positions.map((p) => p.symbol));
+
+    // Get Fear & Greed context for market regime awareness
+    const fngSignal = this.state.signalCache.find((s) => s.source === "fear_greed");
+    const fngContext = fngSignal?.reason || "N/A";
+
     const prompt = `Current Time: ${new Date().toISOString()}
+
+MARKET REGIME:
+- Fear & Greed Index: ${fngContext}
 
 ACCOUNT STATUS:
 - Equity: $${account.equity.toFixed(2)}
@@ -2591,14 +2657,23 @@ Analyze and provide BUY/SELL/HOLD recommendations:`;
         messages: [
           {
             role: "system",
-            content: `You are a senior trading analyst AI. Make the FINAL trading decisions based on social sentiment signals.
+            content: `You are a senior trading analyst AI. Make the FINAL trading decisions based on social sentiment signals and market regime.
 
-Rules:
+MARKET REGIME RULES:
+- Check the Fear & Greed Index to determine market regime
+- CHOPPY/NEUTRAL (F&G 40-60): Be DEFENSIVE. Only BUY with 3+ confirming sources and high conviction. Prefer smaller positions.
+- FEAR (F&G <40): Contrarian opportunity. Look for quality entries at discounted prices if momentum is turning.
+- GREED (F&G >70): Be CAUTIOUS. Tighten stops on existing positions. Avoid chasing late moves.
+- EXTREME FEAR (<20): Strong contrarian BUY signals if fundamentals support it.
+- EXTREME GREED (>80): Consider taking profits on winners. Very selective on new entries.
+
+TRADING RULES:
 - Only recommend BUY for symbols with strong conviction from multiple data points
 - Recommend SELL only for positions that have been held long enough AND show deteriorating sentiment or major red flags
 - Give positions time to develop - avoid selling too early just because gains are small
 - Positions held less than 1-2 hours should generally be given more time unless hitting stop loss
 - Consider the QUALITY of sentiment, not just quantity
+- In choppy markets, cash is a position — it's OK to recommend no trades
 - Output valid JSON only
 
 Response format:
