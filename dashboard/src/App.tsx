@@ -500,7 +500,8 @@ export default function App() {
                   label="AVG COST/CALL" 
                   value={costs.calls > 0 ? `$${(costs.total_usd / costs.calls).toFixed(6)}` : '$0'} 
                 />
-                <MetricInline label="MODEL" value={config?.llm_model || 'gpt-4o-mini'} />
+                <MetricInline label="RESEARCH" value={(config?.llm_model || 'gpt-4o-mini').split('/').pop()?.replace(':free', '') || ''} />
+                <MetricInline label="ANALYST" value={(config?.llm_analyst_model || 'gpt-4o').split('/').pop()?.replace(':free', '') || ''} />
               </div>
             </Panel>
           </div>
@@ -724,7 +725,7 @@ export default function App() {
                               </span>
                             </div>
                           </div>
-                          {research.catalysts.length > 0 && (
+                          {(research.catalysts?.length || 0) > 0 && (
                             <div className="pt-1 border-t border-hud-line/30">
                               <span className="text-[9px] text-hud-text-dim">CATALYSTS:</span>
                               <ul className="mt-1 space-y-0.5">
@@ -734,7 +735,7 @@ export default function App() {
                               </ul>
                             </div>
                           )}
-                          {research.red_flags.length > 0 && (
+                          {(research.red_flags?.length || 0) > 0 && (
                             <div className="pt-1 border-t border-hud-line/30">
                               <span className="text-[9px] text-hud-text-dim">RED FLAGS:</span>
                               <ul className="mt-1 space-y-0.5">
@@ -755,16 +756,16 @@ export default function App() {
                         <div className="flex justify-between items-center mb-1">
                           <span className="hud-value-sm">{symbol}</span>
                           <div className="flex items-center gap-2">
-                            <span className={clsx('hud-label', getQualityColor(research.entry_quality))}>
-                              {research.entry_quality.toUpperCase()}
+                            <span className={clsx('hud-label', getQualityColor(research.entry_quality || 'fair'))}>
+                              {(research.entry_quality || 'N/A').toUpperCase()}
                             </span>
-                            <span className={clsx('hud-value-sm font-bold', getVerdictColor(research.verdict))}>
-                              {research.verdict}
+                            <span className={clsx('hud-value-sm font-bold', getVerdictColor(research.verdict || 'WAIT'))}>
+                              {research.verdict || 'WAIT'}
                             </span>
                           </div>
                         </div>
                         <p className="text-xs text-hud-text-dim leading-tight mb-1">{research.reasoning}</p>
-                        {research.red_flags.length > 0 && (
+                        {(research.red_flags?.length || 0) > 0 && (
                           <div className="flex flex-wrap gap-1">
                             {research.red_flags.slice(0, 2).map((flag, i) => (
                               <span key={i} className="text-xs text-hud-error bg-hud-error/10 px-1 rounded">

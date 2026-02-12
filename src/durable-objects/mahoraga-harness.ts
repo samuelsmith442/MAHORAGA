@@ -280,7 +280,7 @@ const DEFAULT_CONFIG: AgentConfig = {
   stale_mid_min_gain_pct: 3,
   stale_social_volume_decay: 0.3,
   llm_provider: "openai-raw",
-  llm_model: "gpt-4o-mini",
+  llm_model: "z-ai/glm-5",
   llm_analyst_model: "z-ai/glm-5",
   llm_min_hold_minutes: 30,
   options_enabled: false,
