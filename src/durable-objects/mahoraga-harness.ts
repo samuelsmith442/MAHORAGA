@@ -1813,14 +1813,24 @@ export class MahoragaHarness extends DurableObject<Env> {
     if (!this.state.config.crypto_enabled) return;
 
     const cryptoSymbols = new Set(this.state.config.crypto_symbols || []);
-    const cryptoPositions = positions.filter((p) => cryptoSymbols.has(p.symbol) || p.symbol.includes("/"));
+    const cryptoPositions = positions.filter((p) => cryptoSymbols.has(p.symbol) || p.symbol.includes("/") || isCryptoSymbol(p.symbol, this.state.config.crypto_symbols || []));
     const heldCrypto = new Set(cryptoPositions.map((p) => p.symbol));
 
     for (const pos of cryptoPositions) {
       const plPct = (pos.unrealized_pl / (pos.market_value - pos.unrealized_pl)) * 100;
 
+      // Look up entry using both raw and normalized symbol (Alpaca uses UNIUSD, we store UNI/USD)
+      const normalizedSymbol = normalizeCryptoSymbol(pos.symbol);
+      const entry = this.state.positionEntries[pos.symbol] || this.state.positionEntries[normalizedSymbol];
+
+      // Backfill entry_price from Alpaca position data if missing (fixes pre-fix entries)
+      if (entry && entry.entry_price <= 0 && pos.avg_entry_price > 0) {
+        entry.entry_price = pos.avg_entry_price;
+        entry.peak_price = Math.max(pos.avg_entry_price, pos.current_price);
+        this.log("Crypto", "backfill_entry_price", { symbol: pos.symbol, normalized: normalizedSymbol, price: pos.avg_entry_price });
+      }
+
       // Update peak price for trailing stop tracking
-      const entry = this.state.positionEntries[pos.symbol];
       if (entry) {
         entry.peak_price = Math.max(entry.peak_price, pos.current_price);
       }
@@ -1888,11 +1898,22 @@ export class MahoragaHarness extends DurableObject<Env> {
       }
 
       const account = await alpaca.trading.getAccount();
-      const result = await this.executeCryptoBuy(alpaca, signal.symbol, research.confidence, account);
+      const fillPrice = await this.executeCryptoBuy(alpaca, signal.symbol, research.confidence, account);
 
-      if (result) {
+      if (fillPrice > 0) {
         heldCrypto.add(signal.symbol);
         cryptoPositions.push({ symbol: signal.symbol } as Position);
+        this.state.positionEntries[signal.symbol] = {
+          symbol: signal.symbol,
+          entry_time: Date.now(),
+          entry_price: fillPrice,
+          entry_sentiment: signal.sentiment,
+          entry_social_volume: signal.volume || 0,
+          entry_sources: [signal.source || "crypto"],
+          entry_reason: research.reasoning,
+          peak_price: fillPrice,
+          peak_sentiment: signal.sentiment,
+        };
         break;
       }
     }
@@ -2015,7 +2036,7 @@ JSON response:
     symbol: string,
     confidence: number,
     account: Account
-  ): Promise<boolean> {
+  ): Promise<number> {
     const sizePct = Math.min(20, this.state.config.position_size_pct_of_cash);
     const positionSize = Math.min(
       account.cash * (sizePct / 100) * confidence,
@@ -2024,7 +2045,7 @@ JSON response:
 
     if (positionSize < 10) {
       this.log("Crypto", "buy_skipped", { symbol, reason: "Position too small" });
-      return false;
+      return 0;
     }
 
     try {
@@ -2036,11 +2057,20 @@ JSON response:
         time_in_force: "gtc",
       });
 
-      this.log("Crypto", "buy_executed", { symbol, status: order.status, size: positionSize });
-      return true;
+      // Get fill price from order or fall back to market snapshot
+      let fillPrice = order.filled_avg_price ? parseFloat(order.filled_avg_price) : 0;
+      if (!fillPrice || fillPrice <= 0) {
+        try {
+          const snap = await alpaca.marketData.getCryptoSnapshot(symbol).catch(() => null);
+          fillPrice = snap?.latest_trade?.price || 0;
+        } catch { /* use 0 as fallback */ }
+      }
+
+      this.log("Crypto", "buy_executed", { symbol, status: order.status, size: positionSize, fillPrice });
+      return fillPrice;
     } catch (error) {
       this.log("Crypto", "buy_failed", { symbol, error: String(error) });
-      return false;
+      return 0;
     }
   }
 
@@ -2759,6 +2789,14 @@ Response format:
     for (const pos of positions) {
       if (pos.asset_class === "us_option") continue; // Options handled separately
 
+      // Backfill entry_price from Alpaca position data if missing (fixes pre-fix entries)
+      const entry = this.state.positionEntries[pos.symbol];
+      if (entry && entry.entry_price <= 0 && pos.avg_entry_price > 0) {
+        entry.entry_price = pos.avg_entry_price;
+        entry.peak_price = Math.max(pos.avg_entry_price, pos.current_price);
+        this.log("Executor", "backfill_entry_price", { symbol: pos.symbol, price: pos.avg_entry_price });
+      }
+
       const plPct = (pos.unrealized_pl / (pos.market_value - pos.unrealized_pl)) * 100;
 
       // Take profit
@@ -2824,18 +2862,18 @@ Response format:
           }
         }
 
-        const result = await this.executeBuy(alpaca, research.symbol, finalConfidence, account);
-        if (result) {
+        const fillPrice = await this.executeBuy(alpaca, research.symbol, finalConfidence, account);
+        if (fillPrice > 0) {
           heldSymbols.add(research.symbol);
           this.state.positionEntries[research.symbol] = {
             symbol: research.symbol,
             entry_time: Date.now(),
-            entry_price: 0,
+            entry_price: fillPrice,
             entry_sentiment: originalSignal?.sentiment || finalConfidence,
             entry_social_volume: originalSignal?.volume || 0,
             entry_sources: originalSignal?.subreddits || [originalSignal?.source || "research"],
             entry_reason: research.reasoning,
-            peak_price: 0,
+            peak_price: fillPrice,
             peak_sentiment: originalSignal?.sentiment || finalConfidence,
           };
         }
@@ -2879,19 +2917,19 @@ Response format:
           if (heldSymbols.has(rec.symbol)) continue;
           if (researchedSymbols.has(rec.symbol)) continue;
 
-          const result = await this.executeBuy(alpaca, rec.symbol, rec.confidence, account);
-          if (result) {
+          const fillPrice = await this.executeBuy(alpaca, rec.symbol, rec.confidence, account);
+          if (fillPrice > 0) {
             const originalSignal = this.state.signalCache.find((s) => s.symbol === rec.symbol);
             heldSymbols.add(rec.symbol);
             this.state.positionEntries[rec.symbol] = {
               symbol: rec.symbol,
               entry_time: Date.now(),
-              entry_price: 0,
+              entry_price: fillPrice,
               entry_sentiment: originalSignal?.sentiment || rec.confidence,
               entry_social_volume: originalSignal?.volume || 0,
               entry_sources: originalSignal?.subreddits || [originalSignal?.source || "analyst"],
               entry_reason: rec.reasoning,
-              peak_price: 0,
+              peak_price: fillPrice,
               peak_sentiment: originalSignal?.sentiment || rec.confidence,
             };
           }
@@ -2905,20 +2943,20 @@ Response format:
     symbol: string,
     confidence: number,
     account: Account
-  ): Promise<boolean> {
+  ): Promise<number> {
     if (!symbol || symbol.trim().length === 0) {
       this.log("Executor", "buy_blocked", { reason: "INVARIANT: Empty symbol" });
-      return false;
+      return 0;
     }
 
     if (account.cash <= 0) {
       this.log("Executor", "buy_blocked", { symbol, reason: "INVARIANT: No cash available", cash: account.cash });
-      return false;
+      return 0;
     }
 
     if (confidence <= 0 || confidence > 1 || !Number.isFinite(confidence)) {
       this.log("Executor", "buy_blocked", { symbol, reason: "INVARIANT: Invalid confidence", confidence });
-      return false;
+      return 0;
     }
 
     const sizePct = Math.min(20, this.state.config.position_size_pct_of_cash);
@@ -2926,7 +2964,7 @@ Response format:
 
     if (positionSize < 100) {
       this.log("Executor", "buy_skipped", { symbol, reason: "Position too small" });
-      return false;
+      return 0;
     }
 
     const maxAllowed = this.state.config.max_position_value * 1.01;
@@ -2937,7 +2975,7 @@ Response format:
         positionSize,
         maxAllowed,
       });
-      return false;
+      return 0;
     }
 
     try {
@@ -2951,7 +2989,7 @@ Response format:
           const asset = await alpaca.trading.getAsset(symbol);
           if (!asset) {
             this.log("Executor", "buy_blocked", { symbol, reason: "Asset not found" });
-            return false;
+            return 0;
           }
           if (!allowedExchanges.includes(asset.exchange)) {
             this.log("Executor", "buy_blocked", {
@@ -2960,7 +2998,7 @@ Response format:
               exchange: asset.exchange,
               allowedExchanges,
             });
-            return false;
+            return 0;
           }
         }
       }
@@ -2973,11 +3011,25 @@ Response format:
         time_in_force: timeInForce,
       });
 
-      this.log("Executor", "buy_executed", { symbol: orderSymbol, isCrypto, status: order.status, size: positionSize });
-      return true;
+      // Get fill price from order or fall back to market snapshot
+      let fillPrice = order.filled_avg_price ? parseFloat(order.filled_avg_price) : 0;
+      if (!fillPrice || fillPrice <= 0) {
+        try {
+          if (isCrypto) {
+            const snap = await alpaca.marketData.getCryptoSnapshot(symbol).catch(() => null);
+            fillPrice = snap?.latest_trade?.price || 0;
+          } else {
+            const snap = await alpaca.marketData.getSnapshot(symbol).catch(() => null);
+            fillPrice = snap?.latest_trade?.price || snap?.latest_quote?.ask_price || 0;
+          }
+        } catch { /* use 0 as fallback */ }
+      }
+
+      this.log("Executor", "buy_executed", { symbol: orderSymbol, isCrypto, status: order.status, size: positionSize, fillPrice });
+      return fillPrice;
     } catch (error) {
       this.log("Executor", "buy_failed", { symbol, error: String(error) });
-      return false;
+      return 0;
     }
   }
 
@@ -3413,20 +3465,20 @@ Response format:
         if (heldSymbols.has(rec.symbol)) continue;
         if (positions.length >= this.state.config.max_positions) break;
 
-        const result = await this.executeBuy(alpaca, rec.symbol, rec.confidence, account);
-        if (result) {
+        const fillPrice = await this.executeBuy(alpaca, rec.symbol, rec.confidence, account);
+        if (fillPrice > 0) {
           heldSymbols.add(rec.symbol);
 
           const originalSignal = this.state.signalCache.find((s) => s.symbol === rec.symbol);
           this.state.positionEntries[rec.symbol] = {
             symbol: rec.symbol,
             entry_time: Date.now(),
-            entry_price: 0,
+            entry_price: fillPrice,
             entry_sentiment: originalSignal?.sentiment || 0,
             entry_social_volume: originalSignal?.volume || 0,
             entry_sources: originalSignal?.subreddits || [originalSignal?.source || "premarket"],
             entry_reason: rec.reasoning,
-            peak_price: 0,
+            peak_price: fillPrice,
             peak_sentiment: originalSignal?.sentiment || 0,
           };
         }
