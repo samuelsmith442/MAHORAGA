@@ -269,15 +269,15 @@ const DEFAULT_CONFIG: AgentConfig = {
   max_positions: 8,
   min_sentiment_score: 0.25,
   min_analyst_confidence: 0.55,
-  take_profit_pct: 10,
+  take_profit_pct: 8,
   stop_loss_pct: 5,
   position_size_pct_of_cash: 25,
   stale_position_enabled: true,
   stale_min_hold_hours: 24,
-  stale_max_hold_days: 2,
-  stale_min_gain_pct: 3,
-  stale_mid_hold_days: 2,
-  stale_mid_min_gain_pct: 3,
+  stale_max_hold_days: 5,
+  stale_min_gain_pct: 2,
+  stale_mid_hold_days: 3,
+  stale_mid_min_gain_pct: 2,
   stale_social_volume_decay: 0.3,
   llm_provider: "openai-raw",
   llm_model: "z-ai/glm-5",
@@ -2795,6 +2795,11 @@ Response format:
         entry.entry_price = pos.avg_entry_price;
         entry.peak_price = Math.max(pos.avg_entry_price, pos.current_price);
         this.log("Executor", "backfill_entry_price", { symbol: pos.symbol, price: pos.avg_entry_price });
+      }
+
+      // Update peak price for trailing stop tracking
+      if (entry) {
+        entry.peak_price = Math.max(entry.peak_price, pos.current_price);
       }
 
       const plPct = (pos.unrealized_pl / (pos.market_value - pos.unrealized_pl)) * 100;
