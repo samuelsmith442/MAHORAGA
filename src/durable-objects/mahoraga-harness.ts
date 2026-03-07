@@ -202,6 +202,7 @@ interface AgentState {
   positionEntries: Record<string, PositionEntry>;
   socialHistory: Record<string, SocialHistoryEntry[]>;
   logs: LogEntry[];
+  tradeLogs: LogEntry[]; // Separate log for trades only, never rotated
   costTracker: CostTracker;
   lastDataGatherRun: number;
   lastAnalystRun: number;
@@ -309,6 +310,7 @@ const DEFAULT_STATE: AgentState = {
   positionEntries: {},
   socialHistory: {},
   logs: [],
+  tradeLogs: [],
   costTracker: { total_usd: 0, calls: 0, tokens_in: 0, tokens_out: 0 },
   lastDataGatherRun: 0,
   lastAnalystRun: 0,
@@ -1841,18 +1843,21 @@ export class MahoragaHarness extends DurableObject<Env> {
         continue;
       }
 
-      // Trailing stop: if position was up 6%+ and dropped back to 3%, lock in gains
+      // Trailing stop: if position was up 6%+ and dropped 3% from peak, lock in gains
       if (entry && entry.entry_price > 0 && entry.peak_price > 0) {
         const peakGainPct = ((entry.peak_price - entry.entry_price) / entry.entry_price) * 100;
+        const dropFromPeakPct = ((entry.peak_price - pos.current_price) / entry.peak_price) * 100;
         const TRAILING_ACTIVATION_PCT = 6;
-        const TRAILING_LOCK_PCT = 3;
-        if (peakGainPct >= TRAILING_ACTIVATION_PCT && plPct <= TRAILING_LOCK_PCT) {
+        const TRAILING_DROP_PCT = 3;
+        
+        if (peakGainPct >= TRAILING_ACTIVATION_PCT && dropFromPeakPct >= TRAILING_DROP_PCT) {
           this.log("Crypto", "trailing_stop", {
             symbol: pos.symbol,
             pnl: plPct.toFixed(2),
             peak_gain: peakGainPct.toFixed(2),
+            drop_from_peak: dropFromPeakPct.toFixed(2),
           });
-          await this.executeSell(alpaca, pos.symbol, `Crypto trailing stop: was +${peakGainPct.toFixed(1)}%, now +${plPct.toFixed(1)}%`);
+          await this.executeSell(alpaca, pos.symbol, `Crypto trailing stop: peaked +${peakGainPct.toFixed(1)}%, dropped ${dropFromPeakPct.toFixed(1)}% from peak`);
           continue;
         }
       }
@@ -3509,9 +3514,20 @@ Response format:
     };
     this.state.logs.push(entry);
 
-    // Keep last 500 logs
-    if (this.state.logs.length > 500) {
-      this.state.logs = this.state.logs.slice(-500);
+    // Keep last 2000 logs (increased from 500 to preserve more history)
+    if (this.state.logs.length > 2000) {
+      this.state.logs = this.state.logs.slice(-2000);
+    }
+
+    // Also log critical trade events to separate never-rotated log
+    if (action.includes('buy_executed') || action.includes('sell_executed') || 
+        action.includes('take_profit') || action.includes('stop_loss') || 
+        action.includes('trailing_stop') || action.includes('stale_exit')) {
+      this.state.tradeLogs.push(entry);
+      // Keep last 1000 trade logs
+      if (this.state.tradeLogs.length > 1000) {
+        this.state.tradeLogs = this.state.tradeLogs.slice(-1000);
+      }
     }
 
     // Log to console for wrangler tail
