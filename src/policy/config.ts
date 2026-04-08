@@ -79,7 +79,7 @@ export function getDefaultPolicyConfig(env: Env): PolicyConfig {
     trading_hours_only: true,
     extended_hours_allowed: false,
     approval_token_ttl_seconds: parseNumber(env.DEFAULT_APPROVAL_TTL_SECONDS, 300),
-    allow_short_selling: false,
+    allow_short_selling: true,
     use_cash_only: true,
     options: getDefaultOptionsPolicyConfig(),
   };

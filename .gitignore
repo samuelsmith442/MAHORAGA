@@ -17,6 +17,10 @@ agent-config.json
 agent-logs.json
 position-tracker.json
 trade-journal.json
+debug-logs.json
+
+# Test scripts (local development only)
+test-*.ps1
 
 # -----------------------------------------------------------------------------
 # Dependencies

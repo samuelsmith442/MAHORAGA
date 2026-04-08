@@ -5,6 +5,7 @@ import { createD1Client } from "../storage/d1/client";
 import { cleanupExpiredApprovals } from "../storage/d1/queries/approvals";
 import { insertRawEvent, rawEventExists } from "../storage/d1/queries/events";
 import { getRiskState, resetDailyLoss } from "../storage/d1/queries/risk-state";
+import { getHarnessStub } from "../durable-objects/mahoraga-harness";
 
 export async function handleCronEvent(cronId: string, env: Env): Promise<void> {
   switch (cronId) {
@@ -70,6 +71,10 @@ async function runEventIngestion(env: Env): Promise<void> {
     }
 
     console.log(`Event ingestion complete: ${newEvents} new events`);
+    
+    // Trigger Mahoraga Harness to run trading logic
+    const harness = getHarnessStub(env);
+    await harness.fetch(new Request("http://harness/cron"));
   } catch (error) {
     console.error("Event ingestion error:", error);
   }
@@ -128,7 +133,16 @@ async function runMidnightReset(env: Env): Promise<void> {
   }
 }
 
-async function runHourlyCacheRefresh(_env: Env): Promise<void> {
+async function runHourlyCacheRefresh(env: Env): Promise<void> {
   console.log("Running hourly cache refresh...");
   // TODO: Implement cache refresh for KV-cached data (movers, macro, etc.)
+  
+  // Trigger Mahoraga Harness to run crypto research (24/7)
+  try {
+    const harness = getHarnessStub(env);
+    await harness.fetch(new Request("http://harness/cron"));
+    console.log("Triggered Mahoraga Harness for hourly run");
+  } catch (error) {
+    console.error("Hourly harness trigger error:", error);
+  }
 }

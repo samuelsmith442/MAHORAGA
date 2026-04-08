@@ -99,6 +99,13 @@ interface AgentConfig {
   crypto_take_profit_pct: number;
   crypto_stop_loss_pct: number;
 
+  // Short selling - profit from bearish market conditions
+  shorting_enabled: boolean; // [TOGGLE] Enable/disable short selling
+  short_max_position_value: number; // [TUNE] Max $ per short position
+  short_take_profit_pct: number; // [TUNE] Take profit on shorts at this % gain
+  short_stop_loss_pct: number; // [TUNE] Stop loss on shorts at this % loss
+  short_min_confidence: number; // [TUNE] Min LLM confidence for short entry
+
   // Custom ticker blacklist - user-defined symbols to never trade (e.g., insider trading restrictions)
   ticker_blacklist: string[];
 
@@ -132,6 +139,7 @@ interface Signal {
 
 interface PositionEntry {
   symbol: string;
+  side: "long" | "short";
   entry_time: number;
   entry_price: number;
   entry_sentiment: number;
@@ -185,7 +193,7 @@ interface TwitterConfirmation {
 interface PremarketPlan {
   timestamp: number;
   recommendations: Array<{
-    action: "BUY" | "SELL" | "HOLD";
+    action: "BUY" | "SELL" | "HOLD" | "SHORT";
     symbol: string;
     confidence: number;
     reasoning: string;
@@ -196,6 +204,18 @@ interface PremarketPlan {
   researched_buys: ResearchResult[];
 }
 
+interface TradeHistory {
+  symbol: string;
+  entry_price: number;
+  exit_price: number;
+  entry_time: number;
+  exit_time: number;
+  pnl: number;
+  pnl_pct: number;
+  exit_reason: string;
+  entry_quality?: string;
+}
+
 interface AgentState {
   config: AgentConfig;
   signalCache: Signal[];
@@ -203,6 +223,7 @@ interface AgentState {
   socialHistory: Record<string, SocialHistoryEntry[]>;
   logs: LogEntry[];
   tradeLogs: LogEntry[]; // Separate log for trades only, never rotated
+  tradeHistory: TradeHistory[]; // Track closed positions for learning
   costTracker: CostTracker;
   lastDataGatherRun: number;
   lastAnalystRun: number;
@@ -281,8 +302,8 @@ const DEFAULT_CONFIG: AgentConfig = {
   stale_mid_min_gain_pct: 2,
   stale_social_volume_decay: 0.3,
   llm_provider: "openai-raw",
-  llm_model: "z-ai/glm-5",
-  llm_analyst_model: "z-ai/glm-5",
+  llm_model: "meta-llama/llama-3.3-70b-instruct:free",
+  llm_analyst_model: "anthropic/claude-3-haiku-20240307",
   llm_min_hold_minutes: 30,
   options_enabled: false,
   options_min_confidence: 0.8,
@@ -300,6 +321,11 @@ const DEFAULT_CONFIG: AgentConfig = {
   crypto_max_position_value: 1000,
   crypto_take_profit_pct: 12,
   crypto_stop_loss_pct: 6,
+  shorting_enabled: true,
+  short_max_position_value: 5000,
+  short_take_profit_pct: 8,
+  short_stop_loss_pct: 5,
+  short_min_confidence: 0.7,
   ticker_blacklist: [],
   allowed_exchanges: ["NYSE", "NASDAQ", "ARCA", "AMEX", "BATS"],
 };
@@ -311,6 +337,7 @@ const DEFAULT_STATE: AgentState = {
   socialHistory: {},
   logs: [],
   tradeLogs: [],
+  tradeHistory: [],
   costTracker: { total_usd: 0, calls: 0, tokens_in: 0, tokens_out: 0 },
   lastDataGatherRun: 0,
   lastAnalystRun: 0,
@@ -856,8 +883,9 @@ export class MahoragaHarness extends DurableObject<Env> {
   }
 
   private initializeLLM() {
-    const provider = this.state.config.llm_provider || this.env.LLM_PROVIDER || "openai-raw";
-    const model = this.state.config.llm_model || this.env.LLM_MODEL || "gpt-4o-mini";
+    // Force use of environment variable to override cached config
+    const provider = this.env.LLM_PROVIDER || this.state.config.llm_provider || "openai-raw";
+    const model = this.env.LLM_MODEL || this.state.config.llm_model || "gpt-4o-mini";
 
     const effectiveEnv: Env = {
       ...this.env,
@@ -912,8 +940,22 @@ export class MahoragaHarness extends DurableObject<Env> {
 
       const positions = await alpaca.trading.getPositions();
 
+      // Defensive mode: Stop new entries if account is down >20%
+      const account = await alpaca.trading.getAccount();
+      const totalPL = account.equity - 100000; // Starting equity
+      const totalPLPct = (totalPL / 100000) * 100;
+      const isDefensiveMode = totalPLPct < -20;
+
+      if (isDefensiveMode) {
+        this.log("System", "defensive_mode", {
+          equity: account.equity,
+          total_pl_pct: totalPLPct.toFixed(2),
+          message: "Account down >20% - blocking new entries"
+        });
+      }
+
       if (this.state.config.crypto_enabled) {
-        await this.runCryptoTrading(alpaca, positions);
+        await this.runCryptoTrading(alpaca, positions, isDefensiveMode);
       }
 
       if (clock.is_open) {
@@ -1318,10 +1360,10 @@ export class MahoragaHarness extends DurableObject<Env> {
       const trendingData = (await trendingRes.json()) as { symbols?: Array<{ symbol: string }> };
       const trending = trendingData.symbols || [];
 
-      for (const sym of trending.slice(0, 15)) {
+      for (const sym of trending.slice(0, 8)) {
         try {
           const streamRes = await fetchWithRetry(
-            `https://api.stocktwits.com/api/2/streams/symbol/${sym.symbol}.json?limit=30`
+            `https://api.stocktwits.com/api/2/streams/symbol/${sym.symbol}.json?limit=20`
           );
           if (!streamRes) continue;
           const streamData = (await streamRes.json()) as {
@@ -1379,7 +1421,7 @@ export class MahoragaHarness extends DurableObject<Env> {
   }
 
   private async gatherReddit(): Promise<Signal[]> {
-    const subreddits = ["wallstreetbets", "stocks", "investing", "options", "cryptocurrency", "bitcoin"];
+    const subreddits = ["wallstreetbets", "stocks", "cryptocurrency", "bitcoin"];
     const tickerData = new Map<
       string,
       {
@@ -1400,7 +1442,7 @@ export class MahoragaHarness extends DurableObject<Env> {
       const sourceWeight = SOURCE_CONFIG.weights[`reddit_${sub}` as keyof typeof SOURCE_CONFIG.weights] || 0.7;
 
       try {
-        const res = await fetch(`https://www.reddit.com/r/${sub}/hot.json?limit=15`, {
+        const res = await fetch(`https://www.reddit.com/r/${sub}/hot.json?limit=8`, {
           headers: { "User-Agent": "Mahoraga/2.0" },
         });
         if (!res.ok) continue;
@@ -1810,13 +1852,21 @@ export class MahoragaHarness extends DurableObject<Env> {
 
   private async runCryptoTrading(
     alpaca: ReturnType<typeof createAlpacaProviders>,
-    positions: Position[]
+    positions: Position[],
+    isDefensiveMode = false
   ): Promise<void> {
     if (!this.state.config.crypto_enabled) return;
 
     const cryptoSymbols = new Set(this.state.config.crypto_symbols || []);
     const cryptoPositions = positions.filter((p) => cryptoSymbols.has(p.symbol) || p.symbol.includes("/") || isCryptoSymbol(p.symbol, this.state.config.crypto_symbols || []));
     const heldCrypto = new Set(cryptoPositions.map((p) => p.symbol));
+
+    this.log("Crypto", "position_check", {
+      total_positions: positions.length,
+      crypto_positions: cryptoPositions.length,
+      all_symbols: positions.map((p) => p.symbol),
+      crypto_symbols_config: this.state.config.crypto_symbols?.length || 0,
+    });
 
     for (const pos of cryptoPositions) {
       const plPct = (pos.unrealized_pl / (pos.market_value - pos.unrealized_pl)) * 100;
@@ -1865,7 +1915,33 @@ export class MahoragaHarness extends DurableObject<Env> {
       if (plPct <= -this.state.config.crypto_stop_loss_pct) {
         this.log("Crypto", "stop_loss", { symbol: pos.symbol, pnl: plPct.toFixed(2) });
         await this.executeSell(alpaca, pos.symbol, `Crypto stop loss at ${plPct.toFixed(1)}%`);
+        continue;
       }
+
+      // Stale position exit: sell positions held too long (>2 days) with minimal gain
+      if (entry) {
+        const holdHours = (Date.now() - entry.entry_time) / (1000 * 60 * 60);
+        const MAX_HOLD_HOURS = 48;
+        const MIN_GAIN_TO_KEEP = 3;
+        if (holdHours > MAX_HOLD_HOURS && plPct < MIN_GAIN_TO_KEEP) {
+          this.log("Crypto", "stale_exit", {
+            symbol: pos.symbol,
+            pnl: plPct.toFixed(2),
+            hold_hours: holdHours.toFixed(1),
+          });
+          await this.executeSell(alpaca, pos.symbol, `Stale position exit: held ${holdHours.toFixed(0)}h with ${plPct.toFixed(1)}% P&L`);
+          continue;
+        }
+      }
+    }
+
+    // Block new entries in defensive mode
+    if (isDefensiveMode) {
+      this.log("Crypto", "defensive_skip_entries", {
+        message: "Defensive mode active - managing exits only, no new entries",
+        positions: cryptoPositions.length,
+      });
+      return;
     }
 
     const maxCryptoPositions = Math.min(this.state.config.crypto_symbols?.length || 3, 5);
@@ -1910,6 +1986,7 @@ export class MahoragaHarness extends DurableObject<Env> {
         cryptoPositions.push({ symbol: signal.symbol } as Position);
         this.state.positionEntries[signal.symbol] = {
           symbol: signal.symbol,
+          side: "long",
           entry_time: Date.now(),
           entry_price: fillPrice,
           entry_sentiment: signal.sentiment,
@@ -1947,6 +2024,22 @@ export class MahoragaHarness extends DurableObject<Env> {
         .filter((s) => s.symbol === symbol && s.sentiment > 0)
         .map((s) => s.source);
       const uniqueSources = [...new Set(confirmingSources)];
+      
+      // Calculate price action context for better entry timing
+      const dailyBar = snapshot?.daily_bar;
+      const prevDailyBar = snapshot?.prev_daily_bar;
+      const priceAction = dailyBar && prevDailyBar ? {
+        current: price,
+        dailyHigh: dailyBar.h,
+        dailyLow: dailyBar.l,
+        dailyOpen: dailyBar.o,
+        dailyClose: dailyBar.c,
+        prevClose: prevDailyBar.c,
+        distFromHigh: ((price - dailyBar.h) / dailyBar.h) * 100,
+        distFromLow: ((price - dailyBar.l) / dailyBar.l) * 100,
+        dailyRange: dailyBar.h - dailyBar.l,
+        positionInRange: dailyBar.h !== dailyBar.l ? ((price - dailyBar.l) / (dailyBar.h - dailyBar.l)) * 100 : 50
+      } : null;
 
       const prompt = `Should we BUY this cryptocurrency based on momentum, sentiment, and market regime?
 
@@ -1957,6 +2050,14 @@ MOMENTUM SCORE: ${(momentum * 100).toFixed(0)}%
 SENTIMENT: ${(sentiment * 100).toFixed(0)}% bullish
 CONFIRMING SOURCES (${uniqueSources.length}): ${uniqueSources.join(", ") || "none"}
 MARKET FEAR & GREED: ${fngReason}
+${priceAction ? `
+PRICE ACTION (24h):
+- Current: $${priceAction.current.toFixed(2)}
+- Daily Range: $${priceAction.dailyLow.toFixed(2)} - $${priceAction.dailyHigh.toFixed(2)}
+- Distance from 24h high: ${priceAction.distFromHigh.toFixed(1)}%
+- Distance from 24h low: ${priceAction.distFromLow.toFixed(1)}%
+- Position in range: ${priceAction.positionInRange.toFixed(0)}% (0%=low, 100%=high)
+- Previous close: $${priceAction.prevClose.toFixed(2)}` : ''}
 
 MARKET REGIME GUIDANCE:
 - If Fear & Greed is 45-55 (Neutral) or market is choppy/sideways, require STRONGER conviction to BUY
@@ -1969,6 +2070,8 @@ Evaluate if this is a good entry. Consider:
 - Is the momentum sustainable or a bull trap / dead cat bounce?
 - Is the market trending or ranging? Only buy strong setups in ranging markets.
 - Risk/reward at current price level given recent volatility?
+- Price position: Buying near 24h high (>80% of range) is risky. Near low (<30%) may be better entry.
+- Avoid buying at resistance levels or after large moves without pullback.
 
 JSON response:
 {
@@ -2043,9 +2146,13 @@ JSON response:
     account: Account
   ): Promise<number> {
     const sizePct = Math.min(20, this.state.config.position_size_pct_of_cash);
+    const MAX_POSITION_PCT = 0.20; // Never exceed 20% of equity in single position
+    const maxPositionValue = account.equity * MAX_POSITION_PCT;
+    
     const positionSize = Math.min(
       account.cash * (sizePct / 100) * confidence,
-      this.state.config.crypto_max_position_value
+      this.state.config.crypto_max_position_value,
+      maxPositionValue
     );
 
     if (positionSize < 10) {
@@ -2599,7 +2706,7 @@ Provide a brief risk assessment and recommendation (HOLD, SELL, or ADD). JSON fo
     account: Account
   ): Promise<{
     recommendations: Array<{
-      action: "BUY" | "SELL" | "HOLD";
+      action: "BUY" | "SELL" | "HOLD" | "SHORT";
       symbol: string;
       confidence: number;
       reasoning: string;
@@ -2639,6 +2746,21 @@ Provide a brief risk assessment and recommendation (HOLD, SELL, or ADD). JSON fo
     const fngSignal = this.state.signalCache.find((s) => s.source === "fear_greed");
     const fngContext = fngSignal?.reason || "N/A";
 
+    // Calculate account performance metrics
+    const STARTING_EQUITY = 100000;
+    const totalPL = account.equity - STARTING_EQUITY;
+    const totalPLPct = (totalPL / STARTING_EQUITY) * 100;
+    const riskTolerance = totalPLPct < -20 ? "VERY CONSERVATIVE" : totalPLPct < -10 ? "CONSERVATIVE" : totalPLPct < 0 ? "MODERATE" : "NORMAL";
+    
+    // Get recent trade history (last 7 days)
+    const sevenDaysAgo = Date.now() - (7 * 24 * 60 * 60 * 1000);
+    const recentTrades = this.state.tradeHistory.filter(t => t.exit_time > sevenDaysAgo);
+    const wins = recentTrades.filter(t => t.pnl > 0);
+    const losses = recentTrades.filter(t => t.pnl < 0);
+    const winRate = recentTrades.length > 0 ? (wins.length / recentTrades.length) * 100 : 0;
+    const avgWin = wins.length > 0 ? wins.reduce((sum, t) => sum + t.pnl, 0) / wins.length : 0;
+    const avgLoss = losses.length > 0 ? losses.reduce((sum, t) => sum + t.pnl, 0) / losses.length : 0;
+    
     const prompt = `Current Time: ${new Date().toISOString()}
 
 MARKET REGIME:
@@ -2648,6 +2770,18 @@ ACCOUNT STATUS:
 - Equity: $${account.equity.toFixed(2)}
 - Cash: $${account.cash.toFixed(2)}
 - Current Positions: ${positions.length}/${this.state.config.max_positions}
+
+ACCOUNT PERFORMANCE:
+- Total P&L: $${totalPL.toFixed(2)} (${totalPLPct.toFixed(2)}%)
+- Starting Equity: $${STARTING_EQUITY.toFixed(2)}
+- Risk Tolerance: ${riskTolerance}
+${recentTrades.length > 0 ? `
+RECENT PERFORMANCE (last 7 days, ${recentTrades.length} trades):
+- Win Rate: ${winRate.toFixed(0)}% (${wins.length} wins, ${losses.length} losses)
+- Avg Win: $${avgWin.toFixed(2)}
+- Avg Loss: $${avgLoss.toFixed(2)}
+- Recent Closed Positions:
+${recentTrades.slice(-5).map(t => `  * ${t.symbol}: ${t.pnl >= 0 ? '+' : ''}$${t.pnl.toFixed(2)} (${t.pnl_pct >= 0 ? '+' : ''}${t.pnl_pct.toFixed(1)}%) - ${t.exit_reason}${t.entry_quality ? ` [${t.entry_quality} entry]` : ''}`).join('\n')}` : ''}
 
 CURRENT POSITIONS:
 ${
@@ -2684,6 +2818,12 @@ TRADING RULES:
 - Min confidence to trade: ${this.state.config.min_analyst_confidence}
 - Min hold time before selling: ${this.state.config.llm_min_hold_minutes ?? 30} minutes
 
+POSITION SIZING GUIDANCE (based on entry quality):
+- "excellent" entry quality: 15-20% of available cash (high conviction)
+- "good" entry quality: 10-15% of available cash (moderate conviction)
+- "fair" entry quality: 5-10% of available cash (low conviction, consider skipping)
+- "poor" entry quality: SKIP (do not trade)
+
 Analyze and provide BUY/SELL/HOLD recommendations:`;
 
     try {
@@ -2705,16 +2845,19 @@ MARKET REGIME RULES:
 TRADING RULES:
 - Only recommend BUY for symbols with strong conviction from multiple data points
 - Recommend SELL only for positions that have been held long enough AND show deteriorating sentiment or major red flags
+- SHORT SELLING is ENABLED. Recommend SHORT for bearish setups with strong conviction (declining momentum, negative sentiment, breaking support)
+- SHORT entry criteria: multiple bearish signals, negative sentiment trend, weak sector performance, or major negative catalysts
 - Give positions time to develop - avoid selling too early just because gains are small
 - Positions held less than 1-2 hours should generally be given more time unless hitting stop loss
 - Consider the QUALITY of sentiment, not just quantity
 - In choppy markets, cash is a position — it's OK to recommend no trades
+- In bearish markets (Fear < 30), actively look for SHORT opportunities on weak stocks with deteriorating fundamentals
 - Output valid JSON only
 
 Response format:
 {
   "recommendations": [
-    { "action": "BUY"|"SELL"|"HOLD", "symbol": "TICKER", "confidence": 0.0-1.0, "reasoning": "detailed reasoning", "suggested_size_pct": 10-30 }
+    { "action": "BUY"|"SELL"|"HOLD"|"SHORT", "symbol": "TICKER", "confidence": 0.0-1.0, "reasoning": "detailed reasoning", "suggested_size_pct": 10-30 }
   ],
   "market_summary": "overall market read and sentiment",
   "high_conviction_plays": ["symbols you feel strongest about"]
@@ -2735,7 +2878,7 @@ Response format:
       const content = response.content || "{}";
       const analysis = JSON.parse(content.replace(/```json\n?|```/g, "").trim()) as {
         recommendations: Array<{
-          action: "BUY" | "SELL" | "HOLD";
+          action: "BUY" | "SELL" | "HOLD" | "SHORT";
           symbol: string;
           confidence: number;
           reasoning: string;
@@ -2807,17 +2950,23 @@ Response format:
         entry.peak_price = Math.max(entry.peak_price, pos.current_price);
       }
 
-      const plPct = (pos.unrealized_pl / (pos.market_value - pos.unrealized_pl)) * 100;
+      // Use Alpaca's unrealized_plpc (handles both long and short correctly)
+      const plPct = pos.unrealized_plpc * 100;
+      const isShort = pos.side === "short";
 
-      // Take profit
-      if (plPct >= this.state.config.take_profit_pct) {
-        await this.executeSell(alpaca, pos.symbol, `Take profit at +${plPct.toFixed(1)}%`);
+      // Take profit - use short-specific thresholds for short positions
+      const takeProfitPct = isShort ? this.state.config.short_take_profit_pct : this.state.config.take_profit_pct;
+      if (plPct >= takeProfitPct) {
+        const label = isShort ? "Short take profit" : "Take profit";
+        await this.executeSell(alpaca, pos.symbol, `${label} at +${plPct.toFixed(1)}%`);
         continue;
       }
 
-      // Stop loss
-      if (plPct <= -this.state.config.stop_loss_pct) {
-        await this.executeSell(alpaca, pos.symbol, `Stop loss at ${plPct.toFixed(1)}%`);
+      // Stop loss - use short-specific thresholds for short positions
+      const stopLossPct = isShort ? this.state.config.short_stop_loss_pct : this.state.config.stop_loss_pct;
+      if (plPct <= -stopLossPct) {
+        const label = isShort ? "Short stop loss" : "Stop loss";
+        await this.executeSell(alpaca, pos.symbol, `${label} at ${plPct.toFixed(1)}%`);
         continue;
       }
 
@@ -2877,6 +3026,7 @@ Response format:
           heldSymbols.add(research.symbol);
           this.state.positionEntries[research.symbol] = {
             symbol: research.symbol,
+            side: "long",
             entry_time: Date.now(),
             entry_price: fillPrice,
             entry_sentiment: originalSignal?.sentiment || finalConfidence,
@@ -2933,6 +3083,7 @@ Response format:
             heldSymbols.add(rec.symbol);
             this.state.positionEntries[rec.symbol] = {
               symbol: rec.symbol,
+              side: "long",
               entry_time: Date.now(),
               entry_price: fillPrice,
               entry_sentiment: originalSignal?.sentiment || rec.confidence,
@@ -2942,6 +3093,35 @@ Response format:
               peak_price: fillPrice,
               peak_sentiment: originalSignal?.sentiment || rec.confidence,
             };
+          }
+        }
+
+        if (rec.action === "SHORT" && this.state.config.shorting_enabled) {
+          if (positions.length >= this.state.config.max_positions) continue;
+          if (heldSymbols.has(rec.symbol)) continue;
+          if (rec.confidence < this.state.config.short_min_confidence) continue;
+
+          const fillPrice = await this.executeShort(alpaca, rec.symbol, rec.confidence, account);
+          if (fillPrice > 0) {
+            const originalSignal = this.state.signalCache.find((s) => s.symbol === rec.symbol);
+            heldSymbols.add(rec.symbol);
+            this.state.positionEntries[rec.symbol] = {
+              symbol: rec.symbol,
+              side: "short",
+              entry_time: Date.now(),
+              entry_price: fillPrice,
+              entry_sentiment: originalSignal?.sentiment || rec.confidence,
+              entry_social_volume: originalSignal?.volume || 0,
+              entry_sources: originalSignal?.subreddits || [originalSignal?.source || "analyst"],
+              entry_reason: rec.reasoning,
+              peak_price: fillPrice,
+              peak_sentiment: originalSignal?.sentiment || rec.confidence,
+            };
+            this.log("Analyst", "short_opened", {
+              symbol: rec.symbol,
+              confidence: rec.confidence,
+              reasoning: rec.reasoning,
+            });
           }
         }
       }
@@ -2970,7 +3150,14 @@ Response format:
     }
 
     const sizePct = Math.min(20, this.state.config.position_size_pct_of_cash);
-    const positionSize = Math.min(account.cash * (sizePct / 100) * confidence, this.state.config.max_position_value);
+    const MAX_POSITION_PCT = 0.20; // Never exceed 20% of equity in single position
+    const maxPositionValue = account.equity * MAX_POSITION_PCT;
+    
+    const positionSize = Math.min(
+      account.cash * (sizePct / 100) * confidence,
+      this.state.config.max_position_value,
+      maxPositionValue
+    );
 
     if (positionSize < 100) {
       this.log("Executor", "buy_skipped", { symbol, reason: "Position too small" });
@@ -3043,6 +3230,86 @@ Response format:
     }
   }
 
+  private async executeShort(
+    alpaca: ReturnType<typeof createAlpacaProviders>,
+    symbol: string,
+    confidence: number,
+    account: Account
+  ): Promise<number> {
+    if (!symbol || symbol.trim().length === 0) {
+      this.log("Executor", "short_blocked", { reason: "INVARIANT: Empty symbol" });
+      return 0;
+    }
+
+    if (!this.state.config.shorting_enabled) {
+      this.log("Executor", "short_blocked", { symbol, reason: "Shorting disabled in config" });
+      return 0;
+    }
+
+    if (confidence <= 0 || confidence > 1 || !Number.isFinite(confidence)) {
+      this.log("Executor", "short_blocked", { symbol, reason: "INVARIANT: Invalid confidence", confidence });
+      return 0;
+    }
+
+    const sizePct = Math.min(20, this.state.config.position_size_pct_of_cash);
+    const MAX_POSITION_PCT = 0.15; // Conservative: never exceed 15% of equity in single short
+    const maxPositionValue = Math.min(
+      account.equity * MAX_POSITION_PCT,
+      this.state.config.short_max_position_value
+    );
+
+    const positionSize = Math.min(
+      account.cash * (sizePct / 100) * confidence,
+      maxPositionValue
+    );
+
+    if (positionSize < 100) {
+      this.log("Executor", "short_skipped", { symbol, reason: "Position too small" });
+      return 0;
+    }
+
+    try {
+      const allowedExchanges = this.state.config.allowed_exchanges ?? ["NYSE", "NASDAQ", "ARCA", "AMEX", "BATS"];
+      if (allowedExchanges.length > 0) {
+        const asset = await alpaca.trading.getAsset(symbol);
+        if (!asset) {
+          this.log("Executor", "short_blocked", { symbol, reason: "Asset not found" });
+          return 0;
+        }
+        if (!allowedExchanges.includes(asset.exchange)) {
+          this.log("Executor", "short_blocked", { symbol, reason: "Exchange not allowed", exchange: asset.exchange });
+          return 0;
+        }
+        if (!asset.shortable) {
+          this.log("Executor", "short_blocked", { symbol, reason: "Asset not shortable" });
+          return 0;
+        }
+      }
+
+      const order = await alpaca.trading.createOrder({
+        symbol,
+        notional: Math.round(positionSize * 100) / 100,
+        side: "sell",
+        type: "market",
+        time_in_force: "day",
+      });
+
+      let fillPrice = order.filled_avg_price ? parseFloat(order.filled_avg_price) : 0;
+      if (!fillPrice || fillPrice <= 0) {
+        try {
+          const snap = await alpaca.marketData.getSnapshot(symbol).catch(() => null);
+          fillPrice = snap?.latest_trade?.price || snap?.latest_quote?.bid_price || 0;
+        } catch { /* use 0 as fallback */ }
+      }
+
+      this.log("Executor", "short_executed", { symbol, status: order.status, size: positionSize, fillPrice });
+      return fillPrice;
+    } catch (error) {
+      this.log("Executor", "short_failed", { symbol, error: String(error) });
+      return 0;
+    }
+  }
+
   private async executeSell(
     alpaca: ReturnType<typeof createAlpacaProviders>,
     symbol: string,
@@ -3059,12 +3326,45 @@ Response format:
     }
 
     try {
+      // Get position data before closing for trade history
+      const positions = await alpaca.trading.getPositions();
+      const position = positions.find(p => p.symbol === symbol);
+      const entry = this.state.positionEntries[symbol] || this.state.positionEntries[normalizeCryptoSymbol(symbol)];
+      
       await alpaca.trading.closePosition(symbol);
       this.log("Executor", "sell_executed", { symbol, reason });
 
+      // Record trade history for learning
+      if (entry && position) {
+        const pnl = position.unrealized_pl;
+        const pnl_pct = position.unrealized_plpc * 100;
+        
+        this.state.tradeHistory.push({
+          symbol,
+          entry_price: entry.entry_price,
+          exit_price: position.current_price,
+          entry_time: entry.entry_time,
+          exit_time: Date.now(),
+          pnl,
+          pnl_pct,
+          exit_reason: reason,
+          entry_quality: this.state.signalResearch[symbol]?.entry_quality
+        });
+        
+        // Keep only last 50 trades to avoid memory bloat
+        if (this.state.tradeHistory.length > 50) {
+          this.state.tradeHistory = this.state.tradeHistory.slice(-50);
+        }
+      }
+
+      // Delete both normalized (BTC/USD) and raw (BTCUSD) formats
+      const normalizedSymbol = normalizeCryptoSymbol(symbol);
       delete this.state.positionEntries[symbol];
+      delete this.state.positionEntries[normalizedSymbol];
       delete this.state.socialHistory[symbol];
+      delete this.state.socialHistory[normalizedSymbol];
       delete this.state.stalenessAnalysis[symbol];
+      delete this.state.stalenessAnalysis[normalizedSymbol];
 
       return true;
     } catch (error) {
@@ -3482,6 +3782,7 @@ Response format:
           const originalSignal = this.state.signalCache.find((s) => s.symbol === rec.symbol);
           this.state.positionEntries[rec.symbol] = {
             symbol: rec.symbol,
+            side: "long",
             entry_time: Date.now(),
             entry_price: fillPrice,
             entry_sentiment: originalSignal?.sentiment || 0,
@@ -3491,6 +3792,38 @@ Response format:
             peak_price: fillPrice,
             peak_sentiment: originalSignal?.sentiment || 0,
           };
+        }
+      }
+    }
+
+    for (const rec of this.state.premarketPlan.recommendations) {
+      if (rec.action === "SHORT" && this.state.config.shorting_enabled) {
+        if (heldSymbols.has(rec.symbol)) continue;
+        if (positions.length >= this.state.config.max_positions) break;
+        if (rec.confidence < this.state.config.short_min_confidence) continue;
+
+        const fillPrice = await this.executeShort(alpaca, rec.symbol, rec.confidence, account);
+        if (fillPrice > 0) {
+          heldSymbols.add(rec.symbol);
+
+          const originalSignal = this.state.signalCache.find((s) => s.symbol === rec.symbol);
+          this.state.positionEntries[rec.symbol] = {
+            symbol: rec.symbol,
+            side: "short",
+            entry_time: Date.now(),
+            entry_price: fillPrice,
+            entry_sentiment: originalSignal?.sentiment || rec.confidence,
+            entry_social_volume: originalSignal?.volume || 0,
+            entry_sources: originalSignal?.subreddits || [originalSignal?.source || "premarket"],
+            entry_reason: rec.reasoning,
+            peak_price: fillPrice,
+            peak_sentiment: originalSignal?.sentiment || rec.confidence,
+          };
+          this.log("Analyst", "premarket_short_opened", {
+            symbol: rec.symbol,
+            confidence: rec.confidence,
+            reasoning: rec.reasoning,
+          });
         }
       }
     }
