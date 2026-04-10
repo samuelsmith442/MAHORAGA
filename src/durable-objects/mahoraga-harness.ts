@@ -1893,10 +1893,30 @@ export class MahoragaHarness extends DurableObject<Env> {
         continue;
       }
 
-      // Trailing stop: if position was up 6%+ and dropped 3% from peak, lock in gains
+      // Profit protection: multi-tier trailing stop based on peak gains
       if (entry && entry.entry_price > 0 && entry.peak_price > 0) {
         const peakGainPct = ((entry.peak_price - entry.entry_price) / entry.entry_price) * 100;
+        const currentGainPct = ((pos.current_price - entry.entry_price) / entry.entry_price) * 100;
         const dropFromPeakPct = ((entry.peak_price - pos.current_price) / entry.peak_price) * 100;
+        
+        // Tier 1: Early profit protection (3-6% peak gains)
+        // If position peaked at +3% to +6%, exit if it drops below +1%
+        const EARLY_PROFIT_PEAK_MIN = 3;
+        const EARLY_PROFIT_PEAK_MAX = 6;
+        const EARLY_PROFIT_FLOOR = 1;
+        
+        if (peakGainPct >= EARLY_PROFIT_PEAK_MIN && peakGainPct < EARLY_PROFIT_PEAK_MAX && currentGainPct < EARLY_PROFIT_FLOOR) {
+          this.log("Crypto", "early_profit_protection", {
+            symbol: pos.symbol,
+            current_pnl: currentGainPct.toFixed(2),
+            peak_gain: peakGainPct.toFixed(2),
+          });
+          await this.executeSell(alpaca, pos.symbol, `Crypto early profit protection: peaked +${peakGainPct.toFixed(1)}%, now at +${currentGainPct.toFixed(1)}%`);
+          continue;
+        }
+        
+        // Tier 2: Standard trailing stop (6%+ peak gains)
+        // If position peaked at +6%+, exit if it drops 3% from peak
         const TRAILING_ACTIVATION_PCT = 6;
         const TRAILING_DROP_PCT = 3;
         
@@ -2960,6 +2980,43 @@ Response format:
         const label = isShort ? "Short take profit" : "Take profit";
         await this.executeSell(alpaca, pos.symbol, `${label} at +${plPct.toFixed(1)}%`);
         continue;
+      }
+
+      // Profit protection: multi-tier trailing stop (same logic as crypto)
+      if (entry && entry.entry_price > 0 && entry.peak_price > 0 && !isShort) {
+        const peakGainPct = ((entry.peak_price - entry.entry_price) / entry.entry_price) * 100;
+        const currentGainPct = ((pos.current_price - entry.entry_price) / entry.entry_price) * 100;
+        const dropFromPeakPct = ((entry.peak_price - pos.current_price) / entry.peak_price) * 100;
+        
+        // Tier 1: Early profit protection (3-6% peak gains)
+        const EARLY_PROFIT_PEAK_MIN = 3;
+        const EARLY_PROFIT_PEAK_MAX = 6;
+        const EARLY_PROFIT_FLOOR = 1;
+        
+        if (peakGainPct >= EARLY_PROFIT_PEAK_MIN && peakGainPct < EARLY_PROFIT_PEAK_MAX && currentGainPct < EARLY_PROFIT_FLOOR) {
+          this.log("Analyst", "early_profit_protection", {
+            symbol: pos.symbol,
+            current_pnl: currentGainPct.toFixed(2),
+            peak_gain: peakGainPct.toFixed(2),
+          });
+          await this.executeSell(alpaca, pos.symbol, `Early profit protection: peaked +${peakGainPct.toFixed(1)}%, now at +${currentGainPct.toFixed(1)}%`);
+          continue;
+        }
+        
+        // Tier 2: Standard trailing stop (6%+ peak gains)
+        const TRAILING_ACTIVATION_PCT = 6;
+        const TRAILING_DROP_PCT = 3;
+        
+        if (peakGainPct >= TRAILING_ACTIVATION_PCT && dropFromPeakPct >= TRAILING_DROP_PCT) {
+          this.log("Analyst", "trailing_stop", {
+            symbol: pos.symbol,
+            pnl: plPct.toFixed(2),
+            peak_gain: peakGainPct.toFixed(2),
+            drop_from_peak: dropFromPeakPct.toFixed(2),
+          });
+          await this.executeSell(alpaca, pos.symbol, `Trailing stop: peaked +${peakGainPct.toFixed(1)}%, dropped ${dropFromPeakPct.toFixed(1)}% from peak`);
+          continue;
+        }
       }
 
       // Stop loss - use short-specific thresholds for short positions
