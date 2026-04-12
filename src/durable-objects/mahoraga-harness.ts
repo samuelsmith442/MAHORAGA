@@ -39,9 +39,8 @@ import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
 import { createAlpacaProviders } from "../providers/alpaca";
 import { createLLMProvider } from "../providers/llm/factory";
-import type { LLMProvider } from "../providers/llm/types";
+import type { LLMProvider, Account, Position } from "../providers/types";
 import type { PolicyConfig } from "../policy/config";
-import { isCryptoSymbol, normalizeCryptoSymbol } from "../utils/crypto";
 import { generateWeeklyReport, getWeekBounds } from "./weekly-report-generator";
 
 // ============================================================================
