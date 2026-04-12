@@ -40,7 +40,6 @@ import type { Env } from "../env";
 import { createAlpacaProviders } from "../providers/alpaca";
 import { createLLMProvider } from "../providers/llm/factory";
 import type { LLMProvider, Account, Position, MarketClock } from "../providers/types";
-import type { PolicyConfig } from "../policy/config";
 import { generateWeeklyReport, getWeekBounds } from "./weekly-report-generator";
 
 // ============================================================================
