@@ -29,6 +29,10 @@ export async function handleCronEvent(cronId: string, env: Env): Promise<void> {
       await runHourlyCacheRefresh(env);
       break;
 
+    case "0 1 * * 1":
+      await runWeeklyReportGeneration(env);
+      break;
+
     default:
       console.log(`Unknown cron: ${cronId}`);
   }
@@ -144,5 +148,24 @@ async function runHourlyCacheRefresh(env: Env): Promise<void> {
     console.log("Triggered Mahoraga Harness for hourly run");
   } catch (error) {
     console.error("Hourly harness trigger error:", error);
+  }
+}
+
+async function runWeeklyReportGeneration(env: Env): Promise<void> {
+  console.log("Running weekly report generation...");
+  
+  try {
+    const harness = getHarnessStub(env);
+    const response = await harness.fetch(new Request("http://harness/weekly-reports?action=generate"));
+    const data = await response.json() as { ok: boolean; report?: unknown };
+    
+    if (data.ok && data.report) {
+      console.log("Weekly report generated successfully");
+      // TODO: Send report via email or Discord notification
+    } else {
+      console.error("Failed to generate weekly report");
+    }
+  } catch (error) {
+    console.error("Weekly report generation error:", error);
   }
 }

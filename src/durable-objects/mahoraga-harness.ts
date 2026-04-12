@@ -36,10 +36,13 @@
  */
 
 import { DurableObject } from "cloudflare:workers";
-import type { Env } from "../env.d";
+import type { Env } from "../env";
 import { createAlpacaProviders } from "../providers/alpaca";
 import { createLLMProvider } from "../providers/llm/factory";
-import type { Account, LLMProvider, MarketClock, Position } from "../providers/types";
+import type { LLMProvider } from "../providers/llm/types";
+import type { PolicyConfig } from "../policy/config";
+import { isCryptoSymbol, normalizeCryptoSymbol } from "../utils/crypto";
+import { generateWeeklyReport, getWeekBounds } from "./weekly-report-generator";
 
 // ============================================================================
 // SECTION 1: TYPES & CONFIGURATION
@@ -216,6 +219,60 @@ interface TradeHistory {
   entry_quality?: string;
 }
 
+interface WeeklyReport {
+  week_start: number; // Unix timestamp of Monday 00:00 UTC
+  week_end: number; // Unix timestamp of Sunday 23:59 UTC
+  generated_at: number;
+  
+  // Model performance
+  models: {
+    research_model: string;
+    analyst_model: string;
+    total_llm_calls: number;
+    total_llm_cost_usd: number;
+    avg_cost_per_call: number;
+  };
+  
+  // Trading performance
+  trading: {
+    total_trades: number;
+    winning_trades: number;
+    losing_trades: number;
+    win_rate_pct: number;
+    total_pnl_usd: number;
+    avg_pnl_per_trade_usd: number;
+    best_trade: { symbol: string; pnl_pct: number; exit_reason: string } | null;
+    worst_trade: { symbol: string; pnl_pct: number; exit_reason: string } | null;
+    
+    // Breakdown by asset type
+    stocks: { trades: number; pnl_usd: number; win_rate_pct: number };
+    crypto: { trades: number; pnl_usd: number; win_rate_pct: number };
+    shorts: { trades: number; pnl_usd: number; win_rate_pct: number };
+  };
+  
+  // Exit analysis
+  exits: {
+    take_profit: number;
+    stop_loss: number;
+    trailing_stop: number;
+    early_profit_protection: number;
+    stale_exit: number;
+    manual: number;
+  };
+  
+  // Model accuracy
+  accuracy: {
+    research_buy_accuracy_pct: number; // % of BUY verdicts that were profitable
+    analyst_confidence_correlation: number; // Correlation between confidence and actual P&L
+    excellent_entry_win_rate_pct: number; // Win rate for "excellent" entry quality
+    good_entry_win_rate_pct: number; // Win rate for "good" entry quality
+  };
+  
+  // Insights and recommendations
+  insights: string[];
+  recommendations: string[];
+}
+
 interface AgentState {
   config: AgentConfig;
   signalCache: Signal[];
@@ -224,6 +281,7 @@ interface AgentState {
   logs: LogEntry[];
   tradeLogs: LogEntry[]; // Separate log for trades only, never rotated
   tradeHistory: TradeHistory[]; // Track closed positions for learning
+  weeklyReports: WeeklyReport[]; // Weekly performance reports (keep last 12 weeks)
   costTracker: CostTracker;
   lastDataGatherRun: number;
   lastAnalystRun: number;
@@ -338,6 +396,7 @@ const DEFAULT_STATE: AgentState = {
   logs: [],
   tradeLogs: [],
   tradeHistory: [],
+  weeklyReports: [],
   costTracker: { total_usd: 0, calls: 0, tokens_in: 0, tokens_out: 0 },
   lastDataGatherRun: 0,
   lastAnalystRun: 0,
@@ -1112,6 +1171,9 @@ export class MahoragaHarness extends DurableObject<Env> {
         case "history":
           return this.handleGetHistory(url);
 
+        case "weekly-reports":
+          return this.handleGetWeeklyReports(url);
+
         case "trigger":
           await this.alarm();
           return this.jsonResponse({ ok: true, message: "Alarm triggered" });
@@ -1212,6 +1274,25 @@ export class MahoragaHarness extends DurableObject<Env> {
     const limit = parseInt(url.searchParams.get("limit") || "100", 10);
     const logs = this.state.logs.slice(-limit);
     return this.jsonResponse({ logs });
+  }
+
+  private handleGetWeeklyReports(url: URL): Response {
+    const action = url.searchParams.get("action");
+    const limit = parseInt(url.searchParams.get("limit") || "4", 10);
+    
+    if (action === "generate") {
+      // Generate new report for current week
+      const report = this.generateAndStoreWeeklyReport();
+      return this.jsonResponse({ ok: true, report });
+    } else if (action === "latest") {
+      // Get latest report only
+      const report = this.getLatestWeeklyReport();
+      return this.jsonResponse({ ok: true, report });
+    } else {
+      // Get multiple reports (default)
+      const reports = this.getWeeklyReports(limit);
+      return this.jsonResponse({ ok: true, reports, count: reports.length });
+    }
   }
 
   private async handleGetHistory(url: URL): Promise<Response> {
@@ -4046,6 +4127,52 @@ Response format:
     } catch (err) {
       this.log("Discord", "notification_failed", { error: String(err) });
     }
+  }
+
+  // ============================================================================
+  // WEEKLY REPORTING
+  // ============================================================================
+  
+  private generateAndStoreWeeklyReport(weekStart?: number, weekEnd?: number): WeeklyReport {
+    // Get week bounds if not provided
+    const bounds = weekStart && weekEnd ? { start: weekStart, end: weekEnd } : getWeekBounds();
+    
+    const report = generateWeeklyReport(
+      {
+        trades: this.state.tradeHistory,
+        costTracker: this.state.costTracker,
+        researchModel: this.state.config.llm_model,
+        analystModel: this.state.config.llm_analyst_model,
+      },
+      bounds.start,
+      bounds.end
+    );
+    
+    // Store report
+    this.state.weeklyReports.push(report);
+    
+    // Keep only last 12 weeks (3 months)
+    if (this.state.weeklyReports.length > 12) {
+      this.state.weeklyReports = this.state.weeklyReports.slice(-12);
+    }
+    
+    this.log("System", "weekly_report_generated", {
+      week_start: new Date(bounds.start).toISOString(),
+      week_end: new Date(bounds.end).toISOString(),
+      total_trades: report.trading.total_trades,
+      win_rate: report.trading.win_rate_pct.toFixed(1),
+      total_pnl: report.trading.total_pnl_usd.toFixed(2),
+    });
+    
+    return report;
+  }
+  
+  public getWeeklyReports(limit = 4): WeeklyReport[] {
+    return this.state.weeklyReports.slice(-limit);
+  }
+  
+  public getLatestWeeklyReport(): WeeklyReport | null {
+    return this.state.weeklyReports[this.state.weeklyReports.length - 1] || null;
   }
 }
 
