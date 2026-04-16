@@ -349,7 +349,7 @@ const DEFAULT_CONFIG: AgentConfig = {
   min_analyst_confidence: 0.55,
   take_profit_pct: 8,
   stop_loss_pct: 5,
-  position_size_pct_of_cash: 25,
+  position_size_pct_of_cash: 10,
   stale_position_enabled: true,
   stale_min_hold_hours: 24,
   stale_max_hold_days: 5,
@@ -374,7 +374,7 @@ const DEFAULT_CONFIG: AgentConfig = {
   crypto_enabled: true,
   crypto_symbols: ["BTC/USD", "ETH/USD", "SOL/USD", "DOGE/USD", "AVAX/USD", "LINK/USD", "DOT/USD", "MATIC/USD", "UNI/USD", "AAVE/USD"],
   crypto_momentum_threshold: 1.5,
-  crypto_max_position_value: 1000,
+  crypto_max_position_value: 500,
   crypto_take_profit_pct: 12,
   crypto_stop_loss_pct: 6,
   shorting_enabled: true,
@@ -2244,8 +2244,8 @@ JSON response:
     confidence: number,
     account: Account
   ): Promise<number> {
-    const sizePct = Math.min(20, this.state.config.position_size_pct_of_cash);
-    const MAX_POSITION_PCT = 0.20; // Never exceed 20% of equity in single position
+    const sizePct = Math.min(10, this.state.config.position_size_pct_of_cash);
+    const MAX_POSITION_PCT = 0.05; // Never exceed 5% of equity in single crypto position
     const maxPositionValue = account.equity * MAX_POSITION_PCT;
     
     const positionSize = Math.min(
@@ -3285,8 +3285,8 @@ Response format:
       return 0;
     }
 
-    const sizePct = Math.min(20, this.state.config.position_size_pct_of_cash);
-    const MAX_POSITION_PCT = 0.20; // Never exceed 20% of equity in single position
+    const sizePct = Math.min(10, this.state.config.position_size_pct_of_cash);
+    const MAX_POSITION_PCT = 0.10; // Never exceed 10% of equity in single stock position
     const maxPositionValue = account.equity * MAX_POSITION_PCT;
     
     const positionSize = Math.min(
